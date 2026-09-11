@@ -18,11 +18,25 @@ RANKS = "12345678"
 #: Every square of the board, in algebraic notation.
 ALL_SQUARES = [f + r for f in FILES for r in RANKS]
 
+#: The same squares as the ``(row, column)`` coordinates the move generators
+#: speak, in the same order - so ALL_SQUARES doubles as readable test ids.
+ALL_COORDS = [COORDINATES[square_] for square_ in ALL_SQUARES]
+
+
+def coords(squares):
+    '''The coordinates of some named squares, in order.'''
+    return [COORDINATES[square_] for square_ in squares]
+
+
+def coord_set(squares):
+    '''The coordinates of some named squares, as a set.'''
+    return {COORDINATES[square_] for square_ in squares}
+
 
 def square(row, col):
     '''Decode an array index back to algebraic notation.
 
-    Mirrors the expression the move generators use to build their return values.
+    The inverse of ``COORDINATES``, for naming a coordinate a generator returned.
     '''
     return chr(col + ord('a')) + str(8 - row)
 
