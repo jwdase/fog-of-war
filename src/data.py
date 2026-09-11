@@ -53,6 +53,9 @@ board array. Row 0 is rank 8, so a negative row step walks up the board - the
 way white's pawns push.
 '''
 
+BOARD_LOWER = 0 
+BOARD_UPPER = 8
+
 DIAGONAL_STEPS = ((-1, -1), (-1, 1), (1, -1), (1, 1))
 STRAIGHT_STEPS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 KING_STEPS = DIAGONAL_STEPS + STRAIGHT_STEPS
@@ -69,129 +72,110 @@ PAWN_HOME_ROW = {WHITE: 6, BLACK: 1}
 PIECES = { "N": KNIGHT, "B": BISHOP, "R": ROOK, "Q": QUEEN, "K": KING }
 TENSOR_SIZE = 1_000
 
+class Board:
+    def __init__(self, black_pieces, white_pieces):
+        self.black_pieces = black_pieces
+        self.white_pieces = white_pieces
 
+        self.en_passant_white = None        # Means that white can move in that dir if possible
+        self.en_passant_black = None
 
-def _slide(coord, steps, occupied, colour):
-    '''Walks each direction until the board ends, a friend blocks, or a foe is taken'''
-    if coord not in ON_BOARD:
-        raise KeyError(coord)
+        # Board Memory
+        self.board = (np.ones((8, 8)) * EMPTY_SQUARE).astype(str)
 
-    x, y = coord
-    moves = []
+        # Fill Board
+        for pieces, player in ((self.white_pieces, WHITE), (self.black_pieces, BLACK)):
+            for piece, locations in pieces.items():
+                for loc in locations:
+                    self.board[loc] = str(player) + str(piece)
 
-    for dx, dy in steps:
-        for step in range(1, 8):
-            square = (x + dx * step, y + dy * step)
+    def move_black_piece(self, piece, old_loc, new_loc, capture):
+        self.board[old_loc] = str(EMPTY_SQUARE)
+        self.board[new_loc] = str(BLACK) + str(piece)
 
-            # Walked off the board
-            if square not in ON_BOARD:
-                break
+        self.black_pieces[piece].remove(old_loc)
+        self.black_pieces[piece].append(new_loc)
 
-            # Empty square, so keep sliding down the line
-            if square not in occupied:
-                moves.append(square)
-                continue
+        if capture is True: 
+            self.white_pieces.remove(new_loc)
 
-            # A piece stands here and the line stops on it, ours or theirs
-            if occupied[square] != colour:
-                moves.append(square)
-            break
+        # Checks for en-passant
+        if piece == PAWN and old_loc[1] - new_loc[1] == 2:
+            self.en_passant_white = new_loc
+        else:
+            self.en_passant_white = None
 
-    return moves
+    def move_white_piece(self, piece, old_loc, new_loc, capture):
+        self.board[old_loc] = str(EMPTY_SQUARE)
+        self.board[new_loc] = str(WHITE) + str(piece)
 
+        self.white_pieces[piece].remove(old_loc)
+        self.black_pieces[piece].append(new_loc)
 
-def _single_steps(coord, steps, occupied, colour):
-    '''Single steps that land on the board and not on one of our own pieces'''
-    if coord not in ON_BOARD:
-        raise KeyError(coord)
+        if capture is True:
+            self.black_pieces.remove(new_loc)
 
-    x, y = coord
-    moves = []
+        # Checks for en-passant
+        if piece == PAWN and new_loc[1] - old_loc[1] == 2:
+            self.en_passant_black = new_loc
+        else:
+            self.en_passant_black = None
 
-    for dx, dy in steps:
-        square = (x + dx, y + dy)
-        if square in ON_BOARD and occupied.get(square) != colour:
-            moves.append(square)
+    def white_promotion(self, old_loc, new_loc, new_piece, capture):
+        self.move_white_piece(PAWN, old_loc, new_loc, capture)
 
-    return moves
+        # Update Memory
+        self.board[new_loc] = str(WHITE) + str(new_piece)
+        self.white_pieces[PAWN].remove(new_loc)
+        self.white_pieces[new_piece].append(new_loc)
 
+    def black_promotion(self, old_loc, new_loc, new_piece, capture):
+        self.move_black_piece(PAWN, old_loc, new_loc, capture)
 
-def pawn_moves(coord, occupied=None, colour=WHITE, en_passant=None):
-    '''Returns the pushes and captures available to a pawn on a given coordinate
+        # Update Memory
+        self.board[new_loc] = str(BLACK) + str(new_piece)
+        self.black_pieces[PAWN].remove(new_loc)
+        self.black_pieces[new_pieces].append(new_loc)
 
-    The pawn is the one piece that moves and captures differently: it pushes
-    into empty squares only, and takes only diagonally. en_passant is the
-    coordinate it may capture onto despite that square being empty, or None.
-    '''
-    if coord not in ON_BOARD:
-        raise KeyError(coord)
+    def _slide_expand(self, expanse, loc):
+        moves = []
+        x, y = loc
 
-    occupied = occupied or {}
-    x, y = coord
-    dx = PAWN_STEP[colour]
-    moves = []
+        for step in expanse:
+            i = 1
 
-    # Push one, and two from the home row, but only through empty squares
-    one_ahead = (x + dx, y)
-    if one_ahead in ON_BOARD and one_ahead not in occupied:
-        moves.append(one_ahead)
+            while (
+                0 <= x + i * step[0] < 8 and
+                0 <= y + i * step[1] < 8
+                ):
+                moves.append(x + i * step[0], y + i * step[1])
+                
+                if self.board[(x + i * step[0], y + i * step[1])] != str(EMPTY_SQUARE):
+                    break
 
-        two_ahead = (x + 2 * dx, y)
-        if x == PAWN_HOME_ROW[colour] and two_ahead in ON_BOARD and two_ahead not in occupied:
-            moves.append(two_ahead)
+                i += 1
 
-    # Take diagonally, onto an enemy piece or onto the en passant square
-    for dy in (-1, 1):
-        target = (x + dx, y + dy)
-        if target not in ON_BOARD:
-            continue
+        return moves
 
-        if target == en_passant or (target in occupied and occupied[target] != colour):
-            moves.append(target)
+    def gen_moves_rook(self, loc):
+        return self._slide_expand(DIAGONAL_STEPS)
 
-    return moves
+    def gen_moves_bishop(self, loc):
+        return self._slide_expand(STRAIGHT_STEPS)
 
+    def gen_moves_knight(self, loc):
+        x, y = loc
+        return [
+            (x + i_x, y + i_y)
+            for x + i_x, y + i_y in KNIGHT_STEPS
+            if (
+                0 <= x + i_x < 8 and
+                0 <= y + i_y < 8
+            )
+        ]
 
-def knight_moves(coord, occupied=None, colour=WHITE):
-    '''Returns a list of all possible knight moves from a given coordinate
+# Idea -> Generate each piece's moveable locations. 
 
-    A knight jumps, so only the square it lands on can turn a move away.
-    '''
-    return _single_steps(coord, KNIGHT_STEPS, occupied or {}, colour)
-
-
-def bishop_moves(coord, occupied=None, colour=WHITE):
-    '''Returns a list of all possible bishop moves from a given coordinate'''
-    return _slide(coord, DIAGONAL_STEPS, occupied or {}, colour)
-
-
-def rook_moves(coord, occupied=None, colour=WHITE):
-    '''Returns a list of all possible rook moves from a given coordinate'''
-    return _slide(coord, STRAIGHT_STEPS, occupied or {}, colour)
-
-
-def queen_moves(coord, occupied=None, colour=WHITE):
-    '''Returns a list of all possible queen moves from a given coordinate'''
-    return bishop_moves(coord, occupied, colour) + rook_moves(coord, occupied, colour)
-
-
-def king_moves(coord, occupied=None, colour=WHITE):
-    '''Returns a list of all possible king moves from a given coordinate
-
-    One step in any direction. Castling is written as its own move in the
-    notation, so ChessGame.make_move resolves it rather than this function.
-    '''
-    return _single_steps(coord, KING_STEPS, occupied or {}, colour)
-
-
-MOVE_FUNCTIONS = {
-    PAWN: pawn_moves,
-    KNIGHT: knight_moves,
-    BISHOP: bishop_moves,
-    ROOK: rook_moves,
-    QUEEN: queen_moves,
-    KING : king_moves,
-}
 
 class ChessState:
     def __init__(self):
@@ -213,22 +197,6 @@ class ChessState:
                 data[location] = piece
 
         return data
-
-    def occupancy(self):
-        return {
-            coord : colour
-            for pieces, colour in ((self.white_pieces, WHITE), (self.black_pieces, BLACK))
-            for locations in pieces.values()
-            for coord in locations
-        }
-
-    def pieces(self):
-        return {
-                coord: piece
-                for pieces in (self.white_pieces, self.black_pieces)
-                for piece, locations in pieces.items()
-                for coord in locations
-                }
 
     def gen_game(self):
         white_pieces = {
