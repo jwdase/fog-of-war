@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=2.5.3",
     "pandas>=3.0.5",
     "pyarrow>=25.0.1",
+    "python-chess>=1.999",
     "torch>=2.14.0",
 ]
 
