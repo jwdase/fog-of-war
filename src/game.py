@@ -145,7 +145,7 @@ class Board:
                 self.board[(x + i * step[0], y + i * step[1])] * PLAYER[player] < 0):
                 moves.append((x + i * step[0], y + i * step[1]))
 
-            return moves
+        return moves
 
     def gen_checks_rook(self, loc):
         return self._slide_expand_check(STRAIGHT_STEPS, loc)
@@ -255,7 +255,7 @@ class Board:
 
     def gen_king_moves(self, loc, player):
         x, y = loc
-        opp = WHITE if player == WHITE else BLACK
+        opp = BLACK if player == WHITE else WHITE
         check_squares = set(self.check_squares(opp))
 
         return [
