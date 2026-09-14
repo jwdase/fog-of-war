@@ -285,8 +285,11 @@ class ChessGame:
 
         self.games = self.load_data()
 
-        self.input_data = []
-        self.output_data = []
+        # One game is one sample, held as the three boards it is made of until
+        # a shard's worth have piled up.
+        self.white_data = []
+        self.black_data = []
+        self.board_data = []
 
         # Shards are numbered across the whole run, not per file, so a buffer
         # that spans two parquet files cannot overwrite an earlier shard.
@@ -302,9 +305,11 @@ class ChessGame:
     def run_game(self, game_moves):
         '''Play one game out, recording both points of view after every ply.
 
-        Adds two samples, because a game is two training examples: white's view
-        of it and black's.  Both are paired with the same true board, which is
-        the thing the model is being asked to recover from a view of it.
+        A game is one sample, not two: white's view, black's view and the true
+        board they are both a view of, all the same length and lined up ply for
+        ply.  Keeping the two views together is what lets a model be handed the
+        pair - or either one of them - without having to re-pair rows that were
+        split apart on the way to disk.
         '''
         game_data_white = []
         game_data_black = []
@@ -320,15 +325,9 @@ class ChessGame:
             game_data_black.append(game_state_black)
             game_board_layout.append(board_state)
 
-        board = np.array(game_board_layout, dtype=np.int8)
-
-        # Add Game White POV
-        self.input_data.append(np.array(game_data_white, dtype=np.int8))
-        self.output_data.append(board)
-
-        # Add Game Black POV
-        self.input_data.append(np.array(game_data_black, dtype=np.int8))
-        self.output_data.append(board)
+        self.white_data.append(np.array(game_data_white, dtype=np.int8))
+        self.black_data.append(np.array(game_data_black, dtype=np.int8))
+        self.board_data.append(np.array(game_board_layout, dtype=np.int8))
 
     def run_data_process(self):
         i = 0
@@ -348,39 +347,46 @@ class ChessGame:
             print(f"Finished Game: {i}")
             i += 1
 
-            if len(self.input_data) >= game.TENSOR_SIZE:
+            if len(self.board_data) >= game.TENSOR_SIZE:
                 self.save_data()
 
         # Whatever is left over is a short final shard, not something to drop
-        if self.input_data:
+        if self.board_data:
             self.save_data()
 
     def save_data(self):
-        '''Write one shard of samples as ``(N, L, 8, 8)``.
+        '''Write one shard as four aligned tensors, one row per game.
 
-        ``N`` is the samples in the shard - two per game, white's view and
-        black's - and ``L`` is the ply.  Games are not all the same length, so
-        the shard is as long as its longest game and the shorter ones are padded
-        out with empty boards.  ``lengths`` says where each game really ended;
-        the padding is distinguishable without it, since a real ply always has
-        pieces on it, but nothing downstream should have to know that.
+        ``white_board``, ``black_board`` and ``correct_board`` are each
+        ``(N, L, 8, 8)``: ``N`` games, ``L`` plies, an 8x8 board per ply.  Row
+        ``i`` of all three is the same game, so ``white_board[i]`` and
+        ``black_board[i]`` are the two views of ``correct_board[i]``.
+
+        Games are not all the same length, so the shard is as long as its
+        longest game and the shorter ones are padded out with empty boards.
+        ``length`` - ``(N,)`` - says where each game really ended; the padding is
+        distinguishable without it, since a real ply always has pieces on it,
+        but nothing downstream should have to know that.
         '''
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        inputs = self.input_data[0:game.TENSOR_SIZE]
-        outputs = self.output_data[0:game.TENSOR_SIZE]
-        lengths = [len(sample) for sample in inputs]
+        white = self.white_data[0:game.TENSOR_SIZE]
+        black = self.black_data[0:game.TENSOR_SIZE]
+        boards = self.board_data[0:game.TENSOR_SIZE]
+        length = [len(sample) for sample in boards]
 
         torch.save(
             {
-                "input_data" : torch.from_numpy(stack_padded(inputs)),
-                "output_data" : torch.from_numpy(stack_padded(outputs)),
-                "lengths" : torch.tensor(lengths, dtype=torch.int16),
+                "white_board" : torch.from_numpy(stack_padded(white)),
+                "black_board" : torch.from_numpy(stack_padded(black)),
+                "correct_board" : torch.from_numpy(stack_padded(boards)),
+                "length" : torch.tensor(length, dtype=torch.int16),
             }, output_dir / f"{self.current_file.stem}-{self.shard:05d}.pt")
 
         self.shard += 1
-        self.input_data = self.input_data[game.TENSOR_SIZE:]
-        self.output_data = self.output_data[game.TENSOR_SIZE:]
+        self.white_data = self.white_data[game.TENSOR_SIZE:]
+        self.black_data = self.black_data[game.TENSOR_SIZE:]
+        self.board_data = self.board_data[game.TENSOR_SIZE:]
 
     def make_move(self, move, player):
         '''Play one move for the given player.

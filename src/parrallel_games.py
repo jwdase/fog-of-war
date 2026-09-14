@@ -165,11 +165,11 @@ def process_file(source, out_dir, shard_size, limit):
         played += 1
         plies += len(moves)
 
-        if len(pipeline.input_data) >= game.TENSOR_SIZE:
+        if len(pipeline.board_data) >= game.TENSOR_SIZE:
             pipeline.save_data()
 
     # The tail of the file is a short final shard, not something to drop
-    if pipeline.input_data:
+    if pipeline.board_data:
         pipeline.save_data()
 
     return {
@@ -216,7 +216,7 @@ def parse_args(argv=None):
         '--shard-size',
         type=int,
         default=None,
-        help='samples per shard, two per game (default: game.TENSOR_SIZE)',
+        help='games per shard, one sample each (default: game.TENSOR_SIZE)',
     )
     parser.add_argument(
         '--limit',
@@ -276,7 +276,7 @@ def main(argv=None):
     print(f'already done     : {len(done)} (use --overwrite to redo)')
     print(f'workers          : {workers} ({"pinned" if not args.no_affinity else "unpinned"})')
     print(f'output           : {out_dir}')
-    print(f'shard size       : {shard_size} samples ({shard_size // 2} games)')
+    print(f'shard size       : {shard_size} games')
     if args.limit:
         print(f'limit            : {args.limit} games per file')
 

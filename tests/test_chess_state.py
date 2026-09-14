@@ -83,6 +83,22 @@ def random_game(seed, plies):
     return moves
 
 
+def fresh_pipeline():
+    '''A ``ChessGame`` with empty buffers and no parquet file behind it.
+
+    ``__init__`` exists to open the first file and start reading games out of
+    it; these tests feed it games directly, so they skip it and set up only the
+    state ``run_game`` and ``save_data`` touch.
+    '''
+    pipeline = data.ChessGame.__new__(data.ChessGame)
+    pipeline.white_data = []
+    pipeline.black_data = []
+    pipeline.board_data = []
+    pipeline.shard = 0
+
+    return pipeline
+
+
 # --------------------------------------------------------------------------
 # Construction
 # --------------------------------------------------------------------------
@@ -347,41 +363,35 @@ def test_stacking_pads_short_games_with_empty_boards():
     assert (stacked[1] == 1).all(), 'the longest game should not be padded at all'
 
 
-def test_a_game_becomes_two_samples_against_the_same_board():
-    '''One game is two training examples: white's view and black's.
+def test_a_game_becomes_one_sample_of_three_boards():
+    '''One game is one training example holding both views and the truth.
 
-    Both are paired with the same true board, and the pairing is by index - so
-    a sample and its target have to line up, and both have to be as long as the
-    game was.
+    The three buffers are parallel - row ``i`` of each is the same game - so
+    they have to grow together and all be as long as the game was.
     '''
-    pipeline = data.ChessGame.__new__(data.ChessGame)
-    pipeline.input_data, pipeline.output_data, pipeline.shard = [], [], 0
+    pipeline = fresh_pipeline()
     pipeline.state = data.ChessState()
 
     moves = random_game(1, 20)
     pipeline.run_game(moves)
 
-    assert len(pipeline.input_data) == 2, 'a game should add a sample per side'
-    assert len(pipeline.output_data) == 2
+    assert len(pipeline.white_data) == 1, 'a game should add exactly one sample'
+    assert len(pipeline.black_data) == 1
+    assert len(pipeline.board_data) == 1
 
-    for sample, target in zip(pipeline.input_data, pipeline.output_data):
-        assert len(sample) == len(moves), 'one board state per ply'
-        assert len(target) == len(moves)
+    for boards in (pipeline.white_data, pipeline.black_data, pipeline.board_data):
+        assert len(boards[0]) == len(moves), 'one board state per ply'
 
-    assert np.array_equal(pipeline.output_data[0], pipeline.output_data[1]), (
-        'both points of view answer to the same true board'
-    )
-    assert not np.array_equal(pipeline.input_data[0], pipeline.input_data[1]), (
+    assert not np.array_equal(pipeline.white_data[0], pipeline.black_data[0]), (
         'the two points of view should not be the same picture'
     )
 
 
-def test_a_saved_shard_is_n_by_l_by_8_by_8(tmp_path, monkeypatch):
+def test_a_saved_shard_is_four_aligned_tensors(tmp_path, monkeypatch):
     '''What lands on disk has the shape the training code expects.'''
     monkeypatch.setattr(data, 'output_dir', tmp_path)
 
-    pipeline = data.ChessGame.__new__(data.ChessGame)
-    pipeline.input_data, pipeline.output_data, pipeline.shard = [], [], 0
+    pipeline = fresh_pipeline()
     pipeline.current_file = tmp_path / 'train-00000.parquet'
 
     lengths = [30, 44, 12]
@@ -394,15 +404,50 @@ def test_a_saved_shard_is_n_by_l_by_8_by_8(tmp_path, monkeypatch):
     blob = torch.load(tmp_path / 'train-00000-00000.pt')
     longest = max(lengths)
 
-    assert blob['input_data'].shape == (2 * len(lengths), longest, 8, 8)
-    assert blob['output_data'].shape == (2 * len(lengths), longest, 8, 8)
-    assert blob['input_data'].dtype == torch.int8
-    assert blob['lengths'].tolist() == [n for n in lengths for _ in range(2)]
+    assert set(blob) == {'white_board', 'black_board', 'correct_board', 'length'}
+
+    for name in ('white_board', 'black_board', 'correct_board'):
+        assert blob[name].shape == (len(lengths), longest, 8, 8), name
+        assert blob[name].dtype == torch.int8, name
+
+    assert blob['length'].tolist() == lengths
 
     # Past its own length a sample is padding, and padding is empty.
-    for i, length in enumerate(blob['lengths'].tolist()):
-        assert (blob['input_data'][i, length:] == game.EMPTY_SQUARE).all()
-        assert (blob['output_data'][i, length:] == game.EMPTY_SQUARE).all()
+    for i, length in enumerate(blob['length'].tolist()):
+        for name in ('white_board', 'black_board', 'correct_board'):
+            assert (blob[name][i, length:] == game.EMPTY_SQUARE).all(), name
+
+
+def test_both_views_belong_to_the_board_saved_beside_them(tmp_path, monkeypatch):
+    '''A row's two views and its true board are the same game, ply for ply.
+
+    The three tensors are only useful if they are aligned, and nothing about
+    their shapes would show it if they were not: a view is the true board with
+    the hidden squares blanked out, so every piece a side can see has to be the
+    piece that is really there.
+    '''
+    monkeypatch.setattr(data, 'output_dir', tmp_path)
+
+    pipeline = fresh_pipeline()
+    pipeline.current_file = tmp_path / 'train-00000.parquet'
+
+    lengths = [16, 24]
+    for seed, plies in enumerate(lengths, start=1):
+        pipeline.state = data.ChessState()
+        pipeline.run_game(random_game(seed, plies))
+
+    pipeline.save_data()
+    blob = torch.load(tmp_path / 'train-00000-00000.pt')
+
+    for i, length in enumerate(blob['length'].tolist()):
+        truth = blob['correct_board'][i, :length]
+
+        for name in ('white_board', 'black_board'):
+            view = blob[name][i, :length]
+            seen = view != game.EMPTY_SQUARE
+            assert (view[seen] == truth[seen]).all(), (
+                f'{name} row {i} shows pieces that are not on its correct_board'
+            )
 
 
 def test_shards_do_not_overwrite_each_other(tmp_path, monkeypatch):
@@ -414,8 +459,7 @@ def test_shards_do_not_overwrite_each_other(tmp_path, monkeypatch):
     '''
     monkeypatch.setattr(data, 'output_dir', tmp_path)
 
-    pipeline = data.ChessGame.__new__(data.ChessGame)
-    pipeline.input_data, pipeline.output_data, pipeline.shard = [], [], 0
+    pipeline = fresh_pipeline()
     pipeline.current_file = tmp_path / 'train-00000.parquet'
 
     for seed in (1, 2):
