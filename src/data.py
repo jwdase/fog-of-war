@@ -48,6 +48,15 @@ output_dir = DATA_DIR / "processed"
 #: Movetext tokens that are not moves: "1.", "1...", and the result at the end.
 NOT_A_MOVE = re.compile(r'^(?:\d+\.*|1-0|0-1|1/2-1/2|\*)$')
 
+#: PGN comments - ``'{Normal}'``, ``'{Time forfeit}'``.
+#:
+#: Not every file in the corpus is written the same way: train-00020 ends each
+#: game with its termination reason in braces where the others end with the last
+#: move.  A comment can contain spaces, so it has to come out of the movetext
+#: before it is split rather than be dropped token by token afterwards, and the
+#: trailing alternative catches one that is never closed.
+COMMENT = re.compile(r'\{[^}]*\}|\{[^}]*$')
+
 #: What a shard file is called.  The suffix is load-bearing: the resume check in
 #: ``src/parrallel_games.py`` finds finished work by globbing for it.
 SHARD_SUFFIX = '.pt.xz'
@@ -84,8 +93,12 @@ VISION = {
 
 
 def san_moves(movetext):
-    '''The moves in a PGN movetext, with move numbers and the result dropped.'''
-    return [token for token in movetext.split() if not NOT_A_MOVE.match(token)]
+    '''The moves in a PGN movetext: no move numbers, comments or result.'''
+    return [
+        token
+        for token in COMMENT.sub(' ', movetext).split()
+        if not NOT_A_MOVE.match(token)
+    ]
 
 
 def stack_padded(samples):

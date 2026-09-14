@@ -59,9 +59,19 @@ export PYTHONPATH="$REPO"
 # One worker per file; the parent keeps the spare core.
 WORKERS=$(( ${SLURM_CPUS_PER_TASK:-28} - 1 ))
 
+# FOW_LIMIT caps the games taken from each file, for a smoke test that proves
+# the fan-out on a compute node without asking for the full allocation.  Send
+# those shards somewhere other than the real output directory: a file that has
+# shards is a file the real run will skip.
+EXTRA=()
+if [[ -n "${FOW_LIMIT:-}" ]]; then
+    EXTRA+=(--limit "$FOW_LIMIT")
+fi
+
 echo "job        : ${SLURM_JOB_ID:-none} on $(hostname)"
 echo "cores      : ${SLURM_CPUS_PER_TASK:-?} allocated, $WORKERS workers"
 echo "output     : $OUTPUT"
+echo "limit      : ${FOW_LIMIT:-none}"
 echo "started    : $(date)"
 echo
 
@@ -69,7 +79,8 @@ mkdir -p "$OUTPUT"
 
 srun .venv/bin/python -m src.parrallel_games \
     --workers "$WORKERS" \
-    --output "$OUTPUT"
+    --output "$OUTPUT" \
+    "${EXTRA[@]}"
 
 echo
 echo "finished   : $(date)"

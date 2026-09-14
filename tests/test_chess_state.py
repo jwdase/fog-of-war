@@ -214,6 +214,28 @@ def test_movetext_drops_numbers_and_results():
     assert data.san_moves('1. e4 *') == ['e4']
 
 
+def test_movetext_drops_pgn_comments():
+    '''``san_moves`` drops ``{...}`` comments, spaces in them and all.
+
+    train-00020 of the corpus ends every game with its termination reason in
+    braces where the other 26 files end with the last move.  Left in, the
+    comment reaches ``parse_san`` as if it were a move and the game is thrown
+    away at its final ply - which is how a whole file came to produce no
+    training data at all while the run reported no failures.
+
+    The spaces matter: ``'{Time forfeit}'`` is two tokens once split, so this
+    cannot be a filter applied token by token.
+    '''
+    assert data.san_moves('1. e4 e5 {Normal}') == ['e4', 'e5']
+    assert data.san_moves('1. e4 e5 {Time forfeit}') == ['e4', 'e5']
+    assert data.san_moves('1. e4 e5 { Normal }') == ['e4', 'e5']
+    assert data.san_moves('1. e4 {a comment} e5 1-0') == ['e4', 'e5']
+    assert data.san_moves('1. e4 e5 {unterminated') == ['e4', 'e5']
+
+    # A brace must not swallow the moves around it.
+    assert data.san_moves('1. e4 {x} e5 {y} 2. Nf3 {z}') == ['e4', 'e5', 'Nf3']
+
+
 # --------------------------------------------------------------------------
 # Replays - the end-to-end statement
 # --------------------------------------------------------------------------
