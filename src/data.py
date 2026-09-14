@@ -28,7 +28,10 @@ two libraries; ``game.to_coord``, ``game.PIECE_FROM_CHESS`` and ``board_from``
 below are the only places that know it.
 '''
 
+import io
+import lzma
 import re
+from pathlib import Path
 
 import chess
 import numpy as np
@@ -44,6 +47,32 @@ output_dir = DATA_DIR / "processed"
 
 #: Movetext tokens that are not moves: "1.", "1...", and the result at the end.
 NOT_A_MOVE = re.compile(r'^(?:\d+\.*|1-0|0-1|1/2-1/2|\*)$')
+
+#: PGN comments - ``'{Normal}'``, ``'{Time forfeit}'``.
+#:
+#: Not every file in the corpus is written the same way: train-00020 ends each
+#: game with its termination reason in braces where the others end with the last
+#: move.  A comment can contain spaces, so it has to come out of the movetext
+#: before it is split rather than be dropped token by token afterwards, and the
+#: trailing alternative catches one that is never closed.
+COMMENT = re.compile(r'\{[^}]*\}|\{[^}]*$')
+
+#: What a shard file is called.  The suffix is load-bearing: the resume check in
+#: ``src/parrallel_games.py`` finds finished work by globbing for it.
+SHARD_SUFFIX = '.pt.xz'
+
+#: Shards go to disk compressed, and it is not a close call.
+#:
+#: A board barely changes from one ply to the next, and a padded tail is all
+#: zeros, so the arrays are almost entirely redundant.  Measured on a real
+#: 1000-game shard: 36.1 MB raw against 0.8 MB at this preset - 47x - for about
+#: 1.5% of the CPU that generated it, and 0.1s to read back.  Over the corpus
+#: that is ~21 GB instead of ~1.2 TB, which is the difference between the output
+#: fitting on disk and not.
+#:
+#: Preset 1 rather than the default 6: it is both faster and, on data this
+#: repetitive, no worse.
+COMPRESS_PRESET = 1
 
 #: How to ask ``game.Board`` what a piece can see.
 #:
@@ -64,8 +93,12 @@ VISION = {
 
 
 def san_moves(movetext):
-    '''The moves in a PGN movetext, with move numbers and the result dropped.'''
-    return [token for token in movetext.split() if not NOT_A_MOVE.match(token)]
+    '''The moves in a PGN movetext: no move numbers, comments or result.'''
+    return [
+        token
+        for token in COMMENT.sub(' ', movetext).split()
+        if not NOT_A_MOVE.match(token)
+    ]
 
 
 def stack_padded(samples):
@@ -81,6 +114,27 @@ def stack_padded(samples):
         stacked[i, :len(sample)] = sample
 
     return stacked
+
+
+def save_shard(blob, path):
+    '''Write one shard, compressed.
+
+    ``torch.save`` wants a file it can seek, and the compressors want one
+    contiguous block, so the tensors are serialised into memory first.  A shard
+    is ~36 MB at this point, which is small enough to hold.
+    '''
+    buf = io.BytesIO()
+    torch.save(blob, buf)
+    Path(path).write_bytes(lzma.compress(buf.getvalue(), preset=COMPRESS_PRESET))
+
+
+def load_shard(path):
+    '''The ``{white_board, black_board, correct_board, length}`` dict back again.
+
+    The counterpart to :func:`save_shard` - use it rather than ``torch.load``,
+    which cannot read these files.
+    '''
+    return torch.load(io.BytesIO(lzma.decompress(Path(path).read_bytes())))
 
 
 def piece_dicts(cb):
@@ -285,8 +339,11 @@ class ChessGame:
 
         self.games = self.load_data()
 
-        self.input_data = []
-        self.output_data = []
+        # One game is one sample, held as the three boards it is made of until
+        # a shard's worth have piled up.
+        self.white_data = []
+        self.black_data = []
+        self.board_data = []
 
         # Shards are numbered across the whole run, not per file, so a buffer
         # that spans two parquet files cannot overwrite an earlier shard.
@@ -302,9 +359,11 @@ class ChessGame:
     def run_game(self, game_moves):
         '''Play one game out, recording both points of view after every ply.
 
-        Adds two samples, because a game is two training examples: white's view
-        of it and black's.  Both are paired with the same true board, which is
-        the thing the model is being asked to recover from a view of it.
+        A game is one sample, not two: white's view, black's view and the true
+        board they are both a view of, all the same length and lined up ply for
+        ply.  Keeping the two views together is what lets a model be handed the
+        pair - or either one of them - without having to re-pair rows that were
+        split apart on the way to disk.
         '''
         game_data_white = []
         game_data_black = []
@@ -320,15 +379,9 @@ class ChessGame:
             game_data_black.append(game_state_black)
             game_board_layout.append(board_state)
 
-        board = np.array(game_board_layout, dtype=np.int8)
-
-        # Add Game White POV
-        self.input_data.append(np.array(game_data_white, dtype=np.int8))
-        self.output_data.append(board)
-
-        # Add Game Black POV
-        self.input_data.append(np.array(game_data_black, dtype=np.int8))
-        self.output_data.append(board)
+        self.white_data.append(np.array(game_data_white, dtype=np.int8))
+        self.black_data.append(np.array(game_data_black, dtype=np.int8))
+        self.board_data.append(np.array(game_board_layout, dtype=np.int8))
 
     def run_data_process(self):
         i = 0
@@ -348,39 +401,52 @@ class ChessGame:
             print(f"Finished Game: {i}")
             i += 1
 
-            if len(self.input_data) >= game.TENSOR_SIZE:
+            if len(self.board_data) >= game.TENSOR_SIZE:
                 self.save_data()
 
         # Whatever is left over is a short final shard, not something to drop
-        if self.input_data:
+        if self.board_data:
             self.save_data()
 
     def save_data(self):
-        '''Write one shard of samples as ``(N, L, 8, 8)``.
+        '''Write one shard as four aligned tensors, one row per game.
 
-        ``N`` is the samples in the shard - two per game, white's view and
-        black's - and ``L`` is the ply.  Games are not all the same length, so
-        the shard is as long as its longest game and the shorter ones are padded
-        out with empty boards.  ``lengths`` says where each game really ended;
-        the padding is distinguishable without it, since a real ply always has
-        pieces on it, but nothing downstream should have to know that.
+        ``white_board``, ``black_board`` and ``correct_board`` are each
+        ``(N, L, 8, 8)``: ``N`` games, ``L`` plies, an 8x8 board per ply.  Row
+        ``i`` of all three is the same game, so ``white_board[i]`` and
+        ``black_board[i]`` are the two views of ``correct_board[i]``.
+
+        Games are not all the same length, so the shard is as long as its
+        longest game and the shorter ones are padded out with empty boards.
+        ``length`` - ``(N,)`` - says where each game really ended; the padding is
+        distinguishable without it, since a real ply always has pieces on it,
+        but nothing downstream should have to know that.
+
+        The file is compressed - see :func:`save_shard` - so read it back with
+        :func:`load_shard` rather than ``torch.load``.  The padding costs almost
+        nothing once compressed, which is why it is still here.
         '''
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        inputs = self.input_data[0:game.TENSOR_SIZE]
-        outputs = self.output_data[0:game.TENSOR_SIZE]
-        lengths = [len(sample) for sample in inputs]
+        white = self.white_data[0:game.TENSOR_SIZE]
+        black = self.black_data[0:game.TENSOR_SIZE]
+        boards = self.board_data[0:game.TENSOR_SIZE]
+        length = [len(sample) for sample in boards]
 
-        torch.save(
+        save_shard(
             {
-                "input_data" : torch.from_numpy(stack_padded(inputs)),
-                "output_data" : torch.from_numpy(stack_padded(outputs)),
-                "lengths" : torch.tensor(lengths, dtype=torch.int16),
-            }, output_dir / f"{self.current_file.stem}-{self.shard:05d}.pt")
+                "white_board" : torch.from_numpy(stack_padded(white)),
+                "black_board" : torch.from_numpy(stack_padded(black)),
+                "correct_board" : torch.from_numpy(stack_padded(boards)),
+                "length" : torch.tensor(length, dtype=torch.int16),
+            },
+            output_dir / f"{self.current_file.stem}-{self.shard:05d}{SHARD_SUFFIX}",
+        )
 
         self.shard += 1
-        self.input_data = self.input_data[game.TENSOR_SIZE:]
-        self.output_data = self.output_data[game.TENSOR_SIZE:]
+        self.white_data = self.white_data[game.TENSOR_SIZE:]
+        self.black_data = self.black_data[game.TENSOR_SIZE:]
+        self.board_data = self.board_data[game.TENSOR_SIZE:]
 
     def make_move(self, move, player):
         '''Play one move for the given player.

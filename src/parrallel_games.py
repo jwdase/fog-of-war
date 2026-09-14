@@ -15,8 +15,8 @@ One parquet file per worker
 
 Workers write their own shards
     Nothing is sent back to the parent except a line of statistics.
-    ``ChessGame.save_data`` names shards ``<file stem>-<shard>.pt``, and every
-    worker owns a different file stem, so two workers cannot collide on a
+    ``ChessGame.save_data`` names shards ``<file stem>-<shard>.pt.xz``, and
+    every worker owns a different file stem, so two workers cannot collide on a
     filename no matter how the shards line up.  That is the property that lets
     this run without a lock.
 
@@ -119,8 +119,15 @@ def init_worker(pin):
 # --------------------------------------------------------------------------
 
 def shards_of(source, out_dir):
-    '''The shards already on disk for one parquet file.'''
-    return sorted(out_dir.glob(f'{source.stem}-*.pt'))
+    '''The shards already on disk for one parquet file.
+
+    Imported here rather than at module scope: importing ``src.data`` pulls in
+    numpy and torch, and the top of this file has to set the thread-pool
+    environment before any of that happens.
+    '''
+    from src import data
+
+    return sorted(out_dir.glob(f'{source.stem}-*{data.SHARD_SUFFIX}'))
 
 
 def process_file(source, out_dir, shard_size, limit):
@@ -165,11 +172,11 @@ def process_file(source, out_dir, shard_size, limit):
         played += 1
         plies += len(moves)
 
-        if len(pipeline.input_data) >= game.TENSOR_SIZE:
+        if len(pipeline.board_data) >= game.TENSOR_SIZE:
             pipeline.save_data()
 
     # The tail of the file is a short final shard, not something to drop
-    if pipeline.input_data:
+    if pipeline.board_data:
         pipeline.save_data()
 
     return {
@@ -216,7 +223,7 @@ def parse_args(argv=None):
         '--shard-size',
         type=int,
         default=None,
-        help='samples per shard, two per game (default: game.TENSOR_SIZE)',
+        help='games per shard, one sample each (default: game.TENSOR_SIZE)',
     )
     parser.add_argument(
         '--limit',
@@ -276,7 +283,7 @@ def main(argv=None):
     print(f'already done     : {len(done)} (use --overwrite to redo)')
     print(f'workers          : {workers} ({"pinned" if not args.no_affinity else "unpinned"})')
     print(f'output           : {out_dir}')
-    print(f'shard size       : {shard_size} samples ({shard_size // 2} games)')
+    print(f'shard size       : {shard_size} games')
     if args.limit:
         print(f'limit            : {args.limit} games per file')
 
