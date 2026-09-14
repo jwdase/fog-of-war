@@ -401,7 +401,7 @@ def test_a_saved_shard_is_four_aligned_tensors(tmp_path, monkeypatch):
 
     pipeline.save_data()
 
-    blob = torch.load(tmp_path / 'train-00000-00000.pt')
+    blob = data.load_shard(tmp_path / 'train-00000-00000.pt.xz')
     longest = max(lengths)
 
     assert set(blob) == {'white_board', 'black_board', 'correct_board', 'length'}
@@ -437,7 +437,7 @@ def test_both_views_belong_to_the_board_saved_beside_them(tmp_path, monkeypatch)
         pipeline.run_game(random_game(seed, plies))
 
     pipeline.save_data()
-    blob = torch.load(tmp_path / 'train-00000-00000.pt')
+    blob = data.load_shard(tmp_path / 'train-00000-00000.pt.xz')
 
     for i, length in enumerate(blob['length'].tolist()):
         truth = blob['correct_board'][i, :length]
@@ -448,6 +448,43 @@ def test_both_views_belong_to_the_board_saved_beside_them(tmp_path, monkeypatch)
             assert (view[seen] == truth[seen]).all(), (
                 f'{name} row {i} shows pieces that are not on its correct_board'
             )
+
+
+def test_a_shard_round_trips_through_compression(tmp_path, monkeypatch):
+    '''Shards go to disk compressed, and come back byte for byte.
+
+    The arrays are almost all redundancy - a board barely changes from one ply
+    to the next, and a padded tail is all zeros - so this is what keeps the
+    corpus at tens of GB instead of over a terabyte.  Worth asserting the
+    saving is real, not just that the file reads back.
+    '''
+    monkeypatch.setattr(data, 'output_dir', tmp_path)
+
+    pipeline = fresh_pipeline()
+    pipeline.current_file = tmp_path / 'train-00000.parquet'
+
+    for seed, plies in enumerate([40, 55], start=1):
+        pipeline.state = data.ChessState()
+        pipeline.run_game(random_game(seed, plies))
+
+    expected = {
+        'white_board': data.stack_padded(pipeline.white_data).copy(),
+        'black_board': data.stack_padded(pipeline.black_data).copy(),
+        'correct_board': data.stack_padded(pipeline.board_data).copy(),
+    }
+
+    pipeline.save_data()
+    path = tmp_path / 'train-00000-00000.pt.xz'
+    blob = data.load_shard(path)
+
+    for name, array in expected.items():
+        assert np.array_equal(blob[name].numpy(), array), f'{name} did not survive'
+
+    raw = sum(v.nbytes for v in expected.values()) + 2 * 2
+    assert path.stat().st_size < raw / 4, (
+        f'{path.stat().st_size} bytes on disk against {raw} raw - '
+        'compression is not doing its job'
+    )
 
 
 def test_shards_do_not_overwrite_each_other(tmp_path, monkeypatch):
@@ -467,9 +504,9 @@ def test_shards_do_not_overwrite_each_other(tmp_path, monkeypatch):
         pipeline.run_game(random_game(seed, 10))
         pipeline.save_data()
 
-    assert sorted(p.name for p in tmp_path.glob('*.pt')) == [
-        'train-00000-00000.pt',
-        'train-00000-00001.pt',
+    assert sorted(p.name for p in tmp_path.glob('*.pt.xz')) == [
+        'train-00000-00000.pt.xz',
+        'train-00000-00001.pt.xz',
     ]
 
 

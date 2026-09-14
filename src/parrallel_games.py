@@ -15,8 +15,8 @@ One parquet file per worker
 
 Workers write their own shards
     Nothing is sent back to the parent except a line of statistics.
-    ``ChessGame.save_data`` names shards ``<file stem>-<shard>.pt``, and every
-    worker owns a different file stem, so two workers cannot collide on a
+    ``ChessGame.save_data`` names shards ``<file stem>-<shard>.pt.xz``, and
+    every worker owns a different file stem, so two workers cannot collide on a
     filename no matter how the shards line up.  That is the property that lets
     this run without a lock.
 
@@ -119,8 +119,15 @@ def init_worker(pin):
 # --------------------------------------------------------------------------
 
 def shards_of(source, out_dir):
-    '''The shards already on disk for one parquet file.'''
-    return sorted(out_dir.glob(f'{source.stem}-*.pt'))
+    '''The shards already on disk for one parquet file.
+
+    Imported here rather than at module scope: importing ``src.data`` pulls in
+    numpy and torch, and the top of this file has to set the thread-pool
+    environment before any of that happens.
+    '''
+    from src import data
+
+    return sorted(out_dir.glob(f'{source.stem}-*{data.SHARD_SUFFIX}'))
 
 
 def process_file(source, out_dir, shard_size, limit):
